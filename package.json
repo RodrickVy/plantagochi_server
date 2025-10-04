@@ -1,0 +1,27 @@
+{
+  "name": "plantagochi_server",
+  "version": "1.0.0",
+  "description": "A plant health monitoring system integrated into the classic “Tamagotchi” game. Bring your plants to life by plugging in a simple module, so you can have fun while caring for your precious plant!",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RodrickVy/plantagochi_server.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/RodrickVy/plantagochi_server/issues"
+  },
+  "homepage": "https://github.com/RodrickVy/plantagochi_server#readme",
+  "dependencies": {
+    "axios": "^1.12.2",
+    "ejs": "^3.1.10",
+    "express": "^5.1.0",
+    "firebase-admin": "^13.5.0",
+    "moment": "^2.30.1"
+  }
+}
