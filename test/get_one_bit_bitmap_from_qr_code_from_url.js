@@ -5,7 +5,6 @@ const fs = require("fs");
 const app = express();
 const PORT = 3000;
 
-"Finalized the gochi server , that will interact with the ESP32, exposed a sendData() method and onCall() callback to be used later in app. Also testeda means for generating QR code and converting them into 1-bit bitmaps for later displaying on OLED screen. "
 
 async function generateQrCArray(url, outFile = "qr_bitmap.h", varName = "qr_bitmap") {
     try {
