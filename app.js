@@ -5,7 +5,7 @@ import admin from 'firebase-admin';
 import { GoogleGenAI } from '@google/genai';
 import sharp from 'sharp';
 import fs from 'fs';
-import { openPortal, sendData } from './gochi_hardware_server.js'; // Assuming this file is in the same directory
+import { SerialPort, ReadlineParser } from "serialport";
 
 // --- 1. Environment & Initialization ---
 dotenv.config();
@@ -38,20 +38,9 @@ const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const app = express();
 const PORT = 3001;
 
-// Initialize Hardware Portal
-try {
-    openPortal({
-        serialPath: "/dev/tty.usbserial-0001",
-        baudRate: 115200,
-        httpPort: 3000,
-    });
-    console.log('Hardware portal initialized on port 3000');
-} catch (error) {
-    console.error("Failed to open hardware portal:", error.message);
-}
 
+let port, parser;
 
-// --- 2. Firebase Helper Functions ---
 
 /**
  * Gets a document from the plants_db collection by ID.
@@ -84,25 +73,117 @@ async function setDoc(id, object) {
     await plants_db.doc(id).set(object);
 }
 
+export function sendDataToHardware(data) {
+  if (!port) throw new Error("Serial port not initialized. Call openPortal() first.");
+  console.log("➡️ Sending to serial:", data);
+  port.write(data + "\n");
+}
 
 // --- 3. External Data Helper Functions ---
 
 /**
  * Fetches plant data from the House Plants Database API.
- * @param {string} id The plant ID to fetch.
+ * If it fails, get_plant_data_from_gemini() will be used instead.
+ * @param {object} plant The full plant object received from ESP32.
  * @returns {Promise<object>} The plant data object.
  */
-async function get_plant_data(id) {
+async function get_plant_data(plant) {
+    const id = plant.plant_id; // ESP32 sends this
     const url = `https://zylalabs.com/api/774/house+plants+database+api/510/${id}`;
     const headers = { 'Authorization': `Bearer ${ZYLALABS_API_KEY}` };
+    
     try {
-        const response = await axios.get(url, { headers });
-        return response.data;
+      const response = await axios.get(url, { headers });
+      return response.data;
     } catch (error) {
-        console.error(`Error fetching plant data for ID ${id}:`, error.message);
-        throw new Error("Failed to fetch plant data from external API.");
+      console.error(`❌ External API failed for plant ${id}: ${error.message}`);
+      console.log("➡️ Falling back to Gemini...");
+      return await get_plant_data_from_gemini(plant);
     }
-}
+  }
+  
+
+  /**
+ * Fallback: Generates structured plant data using Gemini AI.
+ * @param {object} plant The full plant object received from ESP32.
+ * @returns {Promise<object>} AI-generated plant data in the same structure as API response.
+ */
+async function get_plant_data_from_gemini(plant) {
+    const plantName = plant.plant || "Unknown plant";
+  
+    // Utility helper for single-value fields
+    const ask = async (field, context = "") =>
+      await get_from_gemini(
+        `You are a botanical AI expert. Using your knowledge, give me the best factual value for the field "${field}" for the plant named "${plantName}". ${context} Return as plain text.`
+      );
+  
+    // Helper for list-type fields (up to 2 items)
+    const askList = async (field, context = "") => {
+      const first = await get_from_gemini(
+        `You are a botanical AI expert. Give me ONE relevant value for "${field}" for "${plantName}". ${context} Return plain text only.`
+      );
+      const second = await get_from_gemini(
+        `Give me ANOTHER relevant value for "${field}" for "${plantName}". ${context} Return plain text only.`
+      );
+      return [first, second].filter(Boolean);
+    };
+  
+    // Helper for object-type fields (min/max)
+    const askObject = async (field, unit) => {
+      const min = await get_from_gemini(
+        `Estimate the MINIMUM ${field} of ${plantName} in ${unit}. Return only a number.`
+      );
+      const max = await get_from_gemini(
+        `Estimate the MAXIMUM ${field} of ${plantName} in ${unit}. Return only a number.`
+      );
+      return { M: parseFloat(max) || 0, CM: parseFloat(max * 100) || 0 };
+    };
+  
+    // Construct the fallback object (excluding Img and Url)
+    const aiData = {
+      "Categories": await ask("Categories (e.g., foliage, succulent, etc.)"),
+      "Disease": await ask("Common diseases affecting the plant"),
+      "Img": "", // left blank intentionally
+      "Use": await askList("Plant uses (e.g., table top, air purification, etc.)"),
+      "Latin name": await ask("Latin or scientific name"),
+      "Insects": await askList("Common insects that affect this plant"),
+      "Avaibility": await ask("Availability (rare, regular, common, etc.)"),
+      "Style": await ask("Decorative style or setting preference"),
+      "Bearing": await ask("Growth form (clump, single stem, etc.)"),
+      "Light tolered": await ask("Light tolerated conditions"),
+      "Height at purchase": await askObject("height at purchase", "meters"),
+      "Light ideal": await ask("Ideal light conditions"),
+      "Width at purchase": await askObject("width at purchase", "meters"),
+      "id": plant.plant_id || "",
+      "Appeal": await ask("Main visual appeal (flower, leaves, etc.)"),
+      "Perfume": await ask("Perfume or scent presence"),
+      "Growth": await ask("Growth rate"),
+      "Width potential": await askObject("maximum width", "meters"),
+      "Common name (fr.)": await ask("French common name"),
+      "Pruning": await ask("Pruning needs"),
+      "Family": await ask("Family name of the plant"),
+      "Height potential": await askObject("maximum height", "meters"),
+      "Origin": await askList("Native origins or regions"),
+      "Description": await ask("Short description of the plant"),
+      "Temperature max": { F: 71.6, C: 22 }, // fixed example
+      "Blooming season": await ask("Blooming season"),
+      "Url": "", // left blank intentionally
+      "Color of leaf": await askList("Typical leaf colors"),
+      "Watering": await ask("Watering instructions"),
+      "Color of blooms": await ask("Bloom colors"),
+      "Zone": await askList("Typical hardiness zones"),
+      "Common name": await askList("Common English names"),
+      "Available sizes (Pot)": await ask("Available pot sizes"),
+      "Other names": null,
+      "Temperature min": { F: 64.4, C: 18 }, // fixed example
+      "Pot diameter (cm)": { M: 0.15, CM: 15 },
+      "Climat": await ask("Preferred climate type"),
+    };
+  
+    console.log(`🌿 Gemini fallback generated for ${plantName}`);
+    return aiData;
+  }
+  
 
 /**
  * Fetches raw HTML content from a given URL using Axios.
@@ -209,35 +290,35 @@ async function generateQrHexString(url) {
 }
 
 
-// --- 4. Main Controller Function ---
+// --- 4. Main Controller Function -
 
 /**
  * Main function to fetch, process, and save plant data, and update hardware.
  * @param {string} plant_id The ID of the plant.
  */
-async function set_plant(plant_id) {
-    let plant_data = await getDoc(plant_id);
+async function set_plant(plant_object) {
+    console.log("Plant id is: "+ plant_object.plant_id)
+    let plant_data = await getDoc(plant_object.plant_id.toString());
     let house_plant_api_data;
     let one_bit_bitmap_qr_code_string = '';
 
     if (plant_data) {
-        console.log(`Plant ID ${plant_id} found in Firestore. Skipping data fetching and processing.`);
+        console.log(`Plant ID ${plant_object.plant_id} found in Firestore. Skipping data fetching and processing.`);
         // If data exists, we can still generate and send the QR code if necessary
         const qrUrl = `https://planta-gochi.wepapp/plants?id=${plant_data.id}`;
         one_bit_bitmap_qr_code_string = await generateQrHexString(qrUrl);
-        sendData(one_bit_bitmap_qr_code_string);
+        sendDataToHardware(one_bit_bitmap_qr_code_string);
         return { message: "Plant loaded from database.", plant: plant_data };
     }
 
-    console.log(`Plant ID ${plant_id} not found. Fetching external data...`);
+    console.log(`Plant ID ${plant_object.plant_id} not found. Fetching external data...`);
 
     // --- Data Fetching and AI Processing ---
     try {
-        house_plant_api_data = await get_plant_data(plant_id);
+        house_plant_api_data = await get_plant_data(plant_object);
     } catch (error) {
         return { error: error.message };
     }
-
     // 4.1. Get Ideal Variables from Gemini
     console.log("Getting ideal plant environment values from Gemini...");
     const commonName = house_plant_api_data["Common name"] ? house_plant_api_data["Common name"].join(', ') : 'the plant';
@@ -329,7 +410,7 @@ async function set_plant(plant_id) {
     one_bit_bitmap_qr_code_string = await generateQrHexString(qrUrl);
 
     console.log("Sending QR code bitmap to hardware server...");
-    sendData(one_bit_bitmap_qr_code_string);
+    sendDataToHardware(one_bit_bitmap_qr_code_string);
 
     return {
         message: `New plant (ID: ${plant_data.id}) created, saved, and QR code sent to hardware.`,
@@ -338,25 +419,89 @@ async function set_plant(plant_id) {
 }
 
 
-// --- 7. Express Route Setup ---
+let firstCall = true;
 
-app.get('/set_plant', async (req, res) => {
-    const { plant_id } = req.query;
-
-    if (!plant_id) {
-        return res.status(400).send({ error: 'Missing plant_id query parameter.' });
-    }
-
-    try {
-        const result = await set_plant(plant_id);
-        res.status(200).send(result);
-    } catch (error) {
-        console.error("An error occurred in the set_plant route:", error.message);
-        res.status(500).send({ error: "Server failed to process the request.", detail: error.message });
-    }
-});
+// app.get("/",(res,req)=>{
+//     onData((data)=>{
+//         if(firstCall == true){
+    
+//             const plant_id  = data;
+//             console.log(plant_id + " Go the ID!!!")
+    
+//             if (!plant_id) {
+//                 console.log(plant_id + " Go the ID!!!")
+//             }
+        
+//             try {
+//                 const result =  set_plant(plant_id);
+                
+//             } catch (error) {
+//                 console.error("An error occurred in the set_plant route:", error.message);
+//             }
+    
+//         }else{
+            
+//         }
+    
+       
+//     })
+// })
 
 // Start the Express server
 app.listen(PORT, () => {
     console.log(`🌿 Plant Server running on http://localhost:${PORT}`);
 });
+
+
+
+
+
+export function openPortal() {
+    const _app = express();
+  
+    port = new SerialPort({
+      path: "/dev/tty.usbserial-0001",
+      baudRate: 115200
+    });
+
+    parser = port.pipe(new ReadlineParser({ delimiter: "END" }));
+
+  
+
+parser.on('data', (completeMessage) => {
+    console.log(completeMessage)
+    if (completeMessage) {
+        try {
+          const data = JSON.parse(completeMessage);
+         console.log("✅ Complete JSON received:", data);
+          set_plant(data);
+        } catch (err) {
+        console.error("⚠️ JSON parse error:", completeMessage);
+         //const data = JSON.parse(completeMessage);
+
+         console.error("Raw message:", completeMessage);
+        }
+      }
+    // console.log(chunk + "\n\n\n")
+    // buffer += chunk.toString(); // Keep accumulating partial data
+    
+ 
+    // let start, end;
+    
+    // // As long as we find a complete message enclosed by delimiters
+    // while ((start = buffer.indexOf('END')) !== -1 && 
+    //        (end = buffer.indexOf('END', start + 5)) !== -1) {
+          
+    //   // Extract content between the two delimiters
+    //   const completeMessage = buffer.slice(start+3, end).trim();
+    //   buffer = '';
+      
+    //  console.log(completeMessage + "ln")
+  
+      
+    // }
+  });  
+  
+ }
+
+  openPortal();
